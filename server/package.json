@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
+    "typecheck:eval": "tsc -p tsconfig.eval.json",
     "test": "vitest",
     "eval": "tsx eval/run-evals.ts",
     "seed": "tsx src/db/seed.ts",
