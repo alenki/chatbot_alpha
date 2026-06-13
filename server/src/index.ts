@@ -1,6 +1,18 @@
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Bot } from 'grammy'
 import { loadConfig } from './config.js'
 import { log } from './log.js'
+
+// Load the repo-root .env for local runs (`tsx src/index.ts` / `node dist/index.js`),
+// since neither tsx nor node auto-loads it. From src/ or dist/ this resolves to the
+// repo root. In Docker the file is absent (compose injects vars via env_file), so the
+// try/catch makes this a harmless no-op there. Must run before loadConfig().
+try {
+  process.loadEnvFile(resolve(dirname(fileURLToPath(import.meta.url)), '../../.env'))
+} catch {
+  // .env absent (production container / CI) — env is provided by the environment.
+}
 import { createDb, closeDb } from './db/client.js'
 import {
   TelegramAdapter,
