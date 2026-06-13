@@ -9,6 +9,7 @@
     "dev": "pnpm --filter server dev",
     "test": "pnpm --filter server test -- run",
     "eval": "pnpm --filter server eval",
+    "seed": "pnpm --filter server seed",
     "build": "pnpm -r build"
   }
 }

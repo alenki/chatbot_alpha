@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest",
     "eval": "tsx eval/run-evals.ts",
+    "seed": "tsx src/db/seed.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:migrate:test": "drizzle-kit migrate --config drizzle-test.config.ts"
