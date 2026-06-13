@@ -18,6 +18,7 @@ import { getTestDb, resetDb } from '../src/db/test-utils.js'
 import { seed } from '../src/db/seed.js'
 import { chats, escalations, orders } from '../src/db/schema.js'
 import type { Channel, ChannelAdapter, InboundMessage, OutboundMessage } from '../src/channels/types.js'
+import { OutboxWorker } from '../src/channels/outbox.js'
 import type { ManagerNotifier } from '../src/notify/managers.js'
 import { LlmClient, type ModelProfile } from '../src/brain/llm.js'
 import { priceQuoteTool } from '../src/brain/tools/price-quote.js'
@@ -100,6 +101,7 @@ async function getChatIdByExternal(db: Db, externalChatId: string): Promise<numb
 async function runDialogue(
   db: Db,
   engine: ConversationEngine,
+  worker: OutboxWorker,
   adapter: RecordingAdapter,
   notifier: RecordingNotifier,
   dialogue: GoldenDialogue,
@@ -124,6 +126,11 @@ async function runDialogue(
     await engine.handleInbound(inbound)
     const chatId = await getChatIdByExternal(db, externalChatId)
     if (chatId !== null) await engine.flushChat(chatId)
+    // flushChat enqueues the reply to the outbox; drain it so the RecordingAdapter
+    // actually receives the outbound text (mirrors what OutboxWorker does in prod).
+    for (let drain = 0; drain < 20; drain++) {
+      if ((await worker.processOnce()) === 0) break
+    }
 
     if (!turn.expect) {
       results.push({ dialogue: dialogue.name, turn: t + 1, status: 'PASS', detail: '(no expectation)' })
@@ -201,22 +208,26 @@ async function main(): Promise<void> {
   const adapter = new RecordingAdapter()
   const notifier = new RecordingNotifier()
   const llm = buildLlm(config)
+  const adapters = new Map<Channel, ChannelAdapter>([['telegram', adapter]])
   const engine = new ConversationEngine({
     db,
     llm,
     tools: TOOLS,
     notifier,
-    adapters: new Map<Channel, ChannelAdapter>([['telegram', adapter]]),
+    adapters,
     filesDir: config.FILES_DIR,
     log,
     debounceMs: 50,
   })
+  // Drains the outbox manually (via processOnce) so replies reach the RecordingAdapter
+  // without starting the background polling loop.
+  const worker = new OutboxWorker(db, adapters)
 
   const allResults: TurnResult[] = []
   for (let i = 0; i < selected.length; i++) {
     const dialogue = selected[i]!
     try {
-      const results = await runDialogue(db, engine, adapter, notifier, dialogue, i)
+      const results = await runDialogue(db, engine, worker, adapter, notifier, dialogue, i)
       allResults.push(...results)
     } catch (err) {
       allResults.push({
