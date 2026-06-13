@@ -16,10 +16,10 @@ export default defineConfig({
   dialect: 'postgresql',
   schema: './src/db/schema.ts',
   out: './drizzle',
-  // See drizzle.config.ts: chatbot_app cannot create the `drizzle` schema on this
-  // Supabase DB, so the bookkeeping table lives in `public` instead.
-  migrations: { schema: 'public' },
+  // See drizzle.config.ts: standard `drizzle` bookkeeping schema (survives resetDb,
+  // which only truncates `public`).
   dbCredentials: {
     url: process.env.TEST_DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/chatbot_test',
+    ssl: { rejectUnauthorized: false },
   },
 })

@@ -15,13 +15,15 @@ export default defineConfig({
   dialect: 'postgresql',
   schema: './src/db/schema.ts',
   out: './drizzle',
-  // The provisioned Supabase role (chatbot_app) has CREATE on the `public` schema
-  // but NOT on the `postgres` database, so it cannot create drizzle-kit's default
-  // `drizzle` bookkeeping schema (CREATE SCHEMA needs CREATE-on-database). Keeping
-  // the __drizzle_migrations table in `public` (where the role can create tables)
-  // is the documented way to relocate it. Migrations themselves are idempotent.
-  migrations: { schema: 'public' },
+  // Standard drizzle bookkeeping: __drizzle_migrations lives in the default
+  // `drizzle` schema. The chatbot_app role now has CREATE on the database, so
+  // drizzle's `CREATE SCHEMA IF NOT EXISTS drizzle` succeeds. Keeping it out of
+  // `public` is intentional — resetDb only truncates `public`, so the bookkeeping
+  // table survives test resets.
   dbCredentials: {
     url: process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5432/chatbot',
+    // Supabase pooler presents a chain pg cannot verify; the URL carries
+    // sslmode=no-verify but drizzle-kit's pg connection needs this explicitly.
+    ssl: { rejectUnauthorized: false },
   },
 })
