@@ -10,7 +10,10 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "test": "vitest",
-    "eval": "tsx eval/run-evals.ts"
+    "eval": "tsx eval/run-evals.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:migrate:test": "node scripts/migrate.mjs --test"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.1",
