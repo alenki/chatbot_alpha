@@ -37,6 +37,39 @@ class FakeLlm {
   }
 }
 
+interface Deferred {
+  promise: Promise<LlmResponse>
+  resolve: (res: LlmResponse) => void
+  reject: (err: unknown) => void
+}
+
+/**
+ * LLM stand-in whose every chat() returns a test-controlled deferred promise.
+ * Lets a test pin a flush's (slow, networked) LLM call open and resolve it on
+ * demand — driving the per-chat flush race deterministically, with no timers.
+ */
+class DeferredLlm {
+  calls: { messages: LlmMessage[]; tools: ToolSpec[] }[] = []
+  deferreds: Deferred[] = []
+
+  async chat(msgs: LlmMessage[], tools: ToolSpec[]): Promise<LlmResponse> {
+    this.calls.push({ messages: msgs, tools })
+    let resolve!: (res: LlmResponse) => void
+    let reject!: (err: unknown) => void
+    const promise = new Promise<LlmResponse>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    this.deferreds.push({ promise, resolve, reject })
+    return promise
+  }
+
+  /** Resolves the Nth chat() call (0-based) with a final-text response. */
+  resolveCall(index: number, content: string): void {
+    this.deferreds[index]!.resolve({ content, toolCalls: [], promptTokens: 5, completionTokens: 3 })
+  }
+}
+
 class FakeNotifier implements ManagerNotifier {
   orderCards: number[] = []
   escalationCards: number[] = []
@@ -395,5 +428,68 @@ describe('ConversationEngine', () => {
 
     expect(llm.calls).toHaveLength(0)
     expect(await db.select().from(outbox)).toHaveLength(0)
+  })
+
+  it('answers a client message that arrives while a prior flush is mid-LLM (no role-skip race)', async () => {
+    // Deterministic reproduction of the per-chat flush race (no wall-clock timing):
+    //  A starts and is pinned inside its (slow) LLM call. M2 arrives. B is chained
+    //  after A. A finishes and writes its AI reply (higher id/createdAt than M2).
+    //  Under the OLD role-based guard B sees latest.role==='ai' and skips, so M2 is
+    //  never answered. The id-watermark fix makes B run because M2's id exceeds it.
+    const llm = new DeferredLlm()
+    const { engine, adapter } = makeEngine({ llm: llm as unknown as LlmClient })
+
+    const [chat] = await db
+      .insert(chats)
+      .values({ channel: 'telegram', externalChatId: '555001' })
+      .returning()
+    const chatId = chat!.id
+
+    // M1 → flush A (pinned inside its LLM call; do not await).
+    await db.insert(messages).values({ chatId, role: 'client', content: 'Сколько стоят визитки?' })
+    const pA = engine.flushChat(chatId)
+    await vi.waitFor(() => expect(llm.calls).toHaveLength(1), { timeout: 2000, interval: 5 })
+
+    // M2 arrives while A is mid-LLM → flush B, chained after A.
+    await db.insert(messages).values({ chatId, role: 'client', content: 'И листовки тоже?' })
+    const pB = engine.flushChat(chatId)
+
+    // A finishes (writes its AI reply with a higher id than M2), then B runs.
+    llm.resolveCall(0, 'Визитки 500 шт — от 1600 ₽.')
+    await vi.waitFor(() => expect(llm.calls).toHaveLength(2), { timeout: 2000, interval: 5 })
+    llm.resolveCall(1, 'Листовки А6 — от 900 ₽.')
+
+    await Promise.all([pA, pB])
+
+    // runAgent ran twice (one llm.chat per agent turn, no tool calls).
+    expect(llm.calls).toHaveLength(2)
+    // BOTH client messages got answered: two AI rows, two outbound sends.
+    const aiRows = await db.select().from(messages).where(eq(messages.role, 'ai'))
+    expect(aiRows).toHaveLength(2)
+    expect(aiRows.map((r) => r.content)).toEqual(
+      expect.arrayContaining(['Визитки 500 шт — от 1600 ₽.', 'Листовки А6 — от 900 ₽.']),
+    )
+    expect(await db.select().from(outbox)).toHaveLength(2)
+  })
+
+  it('a redundant chained flush with no new client message skips (debounce + double-run guard)', async () => {
+    // Two flushes scheduled but only ONE client message: B must find the
+    // watermark already at M1's id and skip, so the agent runs exactly once.
+    const { engine, llm } = makeEngine()
+    llm.script = [
+      { content: 'Готов помочь!', toolCalls: [], promptTokens: 9, completionTokens: 4 },
+    ]
+    const [chat] = await db
+      .insert(chats)
+      .values({ channel: 'telegram', externalChatId: '555001' })
+      .returning()
+    const chatId = chat!.id
+    await db.insert(messages).values({ chatId, role: 'client', content: 'Сколько стоят визитки?' })
+
+    await Promise.all([engine.flushChat(chatId), engine.flushChat(chatId)])
+
+    expect(llm.calls).toHaveLength(1)
+    expect(await db.select().from(messages).where(eq(messages.role, 'ai'))).toHaveLength(1)
+    expect(await db.select().from(outbox)).toHaveLength(1)
   })
 })

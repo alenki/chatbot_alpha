@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm'
+import { and, eq, max } from 'drizzle-orm'
 import type { Db } from '../db/client.js'
 import { chats, clients, escalations, messages, processedUpdates, settings } from '../db/schema.js'
 import type { Channel, ChannelAdapter, InboundMessage } from '../channels/types.js'
@@ -32,6 +32,13 @@ export class ConversationEngine {
   // previous flush for the same chat is still awaiting, which would double-run
   // the agent. Each chat's flushes chain onto the previous one's tail.
   private readonly flushChains = new Map<number, Promise<void>>()
+  // Watermark of "answered" client messages, keyed by chatId: the max CLIENT
+  // message id that a COMPLETED flush has already incorporated. A flush skips
+  // when the newest client message id is <= this watermark (already answered),
+  // and runs when a newer client message arrived (e.g. mid-LLM of a prior flush).
+  // This replaces a role/timestamp check, which the AI reply (always sorted
+  // after the client message it answers) would defeat.
+  private readonly answeredClientId = new Map<number, number>()
   private stopped = false
 
   constructor(deps: EngineDeps) {
@@ -175,16 +182,19 @@ export class ConversationEngine {
     // 1. Re-check: a manager or a keyword escalation may have paused the chat while it debounced.
     if (chat.botPaused || chat.status !== 'ai') return
 
-    // A previous flush in this same chain may have already answered the latest
-    // client message (slow-DB debounce overlap). If the newest message is not
-    // from the client, there is nothing new to respond to — skip silently.
-    const [latest] = await db
-      .select({ role: messages.role })
+    // Skip-guard by id-watermark: the max CLIENT message id this flush will answer.
+    // A previous flush in this chain may have already answered the latest client
+    // message (debounce overlap / chained redundant flush). Comparing against an
+    // answered-id watermark — instead of the newest message's role — survives the
+    // race where a slow prior flush inserts its AI reply (higher id) AFTER a new
+    // client message: that client message's id still exceeds the watermark, so we run.
+    const [agg] = await db
+      .select({ maxClientId: max(messages.id) })
       .from(messages)
-      .where(eq(messages.chatId, chatId))
-      .orderBy(desc(messages.createdAt), desc(messages.id))
-      .limit(1)
-    if (latest === undefined || latest.role !== 'client') return
+      .where(and(eq(messages.chatId, chatId), eq(messages.role, 'client')))
+    const maxClientId = agg?.maxClientId ?? null
+    if (maxClientId === null) return // no client message to answer
+    if (maxClientId <= (this.answeredClientId.get(chatId) ?? 0)) return // already answered by a prior flush
 
     // 2. Daily turn cap (anti-loop, anti-injection cost ceiling). A stale date resets the counter.
     const today = new Date().toISOString().slice(0, 10)
@@ -197,6 +207,7 @@ export class ConversationEngine {
         text: CAP_MESSAGE,
       })
       await this.escalate(chatId, 'Достигнут дневной лимит ответов ИИ', `Чат превысил лимит ${cap} AI-ответов в день`)
+      this.answeredClientId.set(chatId, maxClientId)
       return
     }
 
@@ -230,6 +241,7 @@ export class ConversationEngine {
         if (!result.escalated) {
           await this.escalate(chatId, 'AI не смог сформировать ответ', '')
         }
+        this.answeredClientId.set(chatId, maxClientId)
         return
       }
 
@@ -247,6 +259,10 @@ export class ConversationEngine {
         externalChatId: chat.externalChatId,
         text: result.reply,
       })
+      // Mark exactly the client messages this flush saw as answered. Messages that
+      // arrived during runAgent have higher ids and stay above the watermark, so a
+      // later (chained) flush still runs and answers them.
+      this.answeredClientId.set(chatId, maxClientId)
     } catch (err) {
       // 6. Degrade gracefully — the client never sees an error or silence.
       if (err instanceof LlmRateLimitedError) {
@@ -256,6 +272,7 @@ export class ConversationEngine {
           text: CAP_MESSAGE,
         })
         await this.escalate(chatId, 'Лимит нейросети исчерпан', '')
+        this.answeredClientId.set(chatId, maxClientId)
         return
       }
       if (err instanceof LlmUnavailableError) {
@@ -265,9 +282,13 @@ export class ConversationEngine {
           text: LLM_DOWN_MESSAGE,
         })
         await this.escalate(chatId, 'Нейросеть недоступна', '')
+        this.answeredClientId.set(chatId, maxClientId)
         return
       }
-      throw err // unexpected → the timer guard logs it; a direct caller (test/flush) sees it
+      // Unexpected (non-LLM-typed) error: do NOT advance the watermark — the next
+      // client message should retry this turn. The timer guard logs it; a direct
+      // caller (test/flush) sees it.
+      throw err
     }
   }
 
@@ -276,6 +297,7 @@ export class ConversationEngine {
     this.stopped = true
     for (const timer of this.timers.values()) clearTimeout(timer)
     this.timers.clear()
+    this.answeredClientId.clear()
     await Promise.allSettled([...this.inFlight])
   }
 }
